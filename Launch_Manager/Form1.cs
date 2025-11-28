@@ -8,6 +8,8 @@ using System.Diagnostics;
 using System.Text.RegularExpressions;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
+using System.IO.Compression;
+using System.Reflection;
 
 namespace Launch_Manager
 {
@@ -23,12 +25,11 @@ namespace Launch_Manager
         [DllImport("user32.dll")]
         public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
+     
         const int MY_HOTKEY_ID = 9000;
-
-        // Modifiers: 0x0001=Alt, 0x0002=Ctrl, 0x0004=Shift, 0x0008=Win
-        // We will use CTRL + ALT + F10
-        const int MOD_CONTROL = 0x0002;
-        const int MOD_ALT = 0x0001;
+        // Using F10 only for maximum compatibility (No modifiers needed for testing)
+     
+        const int MOD_NONE = 0x0000;
         const int VK_F10 = 0x79;
 
         public Form1()
@@ -58,7 +59,63 @@ namespace Launch_Manager
             fakeError.Location = new Point(10, 10);
             this.Controls.Add(fakeError);
 
-            if (notifyIcon1.Icon == null) notifyIcon1.Icon = SystemIcons.Application;
+            if (notifyIcon1.Icon == null) notifyIcon1.Icon = SystemIcons.Shield;
+        }
+        private async void StartSystem()
+        {
+            // 1. Hide the Console
+            this.Hide();
+            this.ShowInTaskbar = false;
+
+            // 2. SHOW TRAY ICON IMMEDIATELY (So you know it's working)
+            notifyIcon1.Visible = true;
+            notifyIcon1.ShowBalloonTip(3000, "System Loading", "Decrypting engine... Please wait.", ToolTipIcon.Info);
+
+            // 3. Register Hotkey
+            RegisterHotKey(this.Handle, MY_HOTKEY_ID, MOD_NONE, VK_F10);
+
+            // 4. EXTRACT ENGINE (Run in background task to prevent freezing)
+            bool extractionSuccess = await Task.Run(() => ExtractEngine());
+
+            if (extractionSuccess)
+            {
+                // 5. LAUNCH VM
+                LaunchVM();
+            }
+        }
+
+        private bool ExtractEngine()
+        {
+            try
+            {
+                string currentPath = AppDomain.CurrentDomain.BaseDirectory;
+                string binPath = Path.Combine(currentPath, "bin");
+
+                // If bin folder exists, verify contents or delete
+                if (Directory.Exists(binPath))
+                {
+                    try { Directory.Delete(binPath, true); } catch { /* Ignore if locked */ }
+                }
+
+                Directory.CreateDirectory(binPath);
+
+                // Extract Resource
+                byte[] zipBytes = Properties.Resources.engine;
+
+                string zipPath = Path.Combine(currentPath, "temp_engine.zip");
+                File.WriteAllBytes(zipPath, zipBytes);
+
+                ZipFile.ExtractToDirectory(zipPath, binPath);
+                File.Delete(zipPath);
+
+                return true; // Success
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Critical Error during Extraction:\n" + ex.Message);
+                Application.Exit();
+                return false;
+            }
         }
 
         private void Form1_KeyPress(object sender, KeyPressEventArgs e)
@@ -86,18 +143,7 @@ namespace Launch_Manager
             }
         }
 
-        private void StartSystem()
-        {
-            // 1. HIDE THE CONSOLE
-            this.Hide();
-            this.ShowInTaskbar = false;
 
-            // 2. REGISTER PANIC HOTKEY (CTRL + ALT + F10)
-            RegisterHotKey(this.Handle, MY_HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_F10);
-
-            // 3. LAUNCH VM
-            LaunchVM();
-        }
 
         // --- HOTKEY LISTENER ---
         protected override void WndProc(ref Message m)
@@ -117,18 +163,24 @@ namespace Launch_Manager
             try
             {
                 string currentPath = AppDomain.CurrentDomain.BaseDirectory;
+                string binPath = Path.Combine(currentPath, "bin");
+                string diskPath = Path.Combine(currentPath, "data", "resource.dat");
 
-                // 1. LOCATE THE ENGINE & DISK
-                string qemuExe = Path.Combine(currentPath, "bin", "qemu-system-x86_64.exe");
-                string diskPath = Path.Combine(currentPath, "data", "vm_disk.qcow2");
+                // FIX: Search for the exe in subfolders in case zip structure was weird
+                string qemuExe = "";
+                string[] files = Directory.GetFiles(binPath, "qemu-system-x86_64.exe", SearchOption.AllDirectories);
 
-                // 2. CHECK FILES
-                if (!File.Exists(qemuExe))
+                if (files.Length > 0)
                 {
-                    MessageBox.Show("Critical Error: Engine not found at:\n" + qemuExe);
-                    Application.Exit();
+                    qemuExe = files[0];
+                }
+                else
+                {
+                    MessageBox.Show("Critical Error: QEMU Engine not found in extracted files.");
+                    PerformCleanAndExit();
                     return;
                 }
+
                 if (!File.Exists(diskPath))
                 {
                     MessageBox.Show("Critical Error: Hard Drive not found at:\n" + diskPath);
@@ -197,6 +249,23 @@ namespace Launch_Manager
             await Task.Delay(400);
             Log(logLabel, "[OK] Registry Keys Wiped.");
 
+            Log(logLabel, "Wiping temporary engine files...");
+            string currentPath = AppDomain.CurrentDomain.BaseDirectory;
+            string binPath = Path.Combine(currentPath, "bin");
+
+            // We do NOT delete 'data' because that holds his OS (resource.dat)
+            // We ONLY delete 'bin' (the QEMU engine we extracted)
+
+            try
+            {
+                if (Directory.Exists(binPath))
+                {
+                    Directory.Delete(binPath, true);
+                    Log(logLabel, "[OK] Engine Removed. Traces gone.");
+                }
+            }
+            catch { Log(logLabel, "[FAIL] Could not delete bin folder."); }
+
             // 4. USB Clean
             Log(logLabel, "Scanning USB Hub History...");
             await Task.Delay(500); // Fake delay for drama
@@ -258,19 +327,22 @@ namespace Launch_Manager
         {
             try
             {
-                string binPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "bin");
-                string usbDeviewPath = Path.Combine(binPath, "USBDeview.exe");
-                string reportPath = Path.Combine(binPath, "report.txt");
+                string currentPath = AppDomain.CurrentDomain.BaseDirectory;
+                string binPath = Path.Combine(currentPath, "bin");
 
-                if (File.Exists(usbDeviewPath))
-                {
-                    ProcessStartInfo psi = new ProcessStartInfo();
-                    psi.FileName = usbDeviewPath;
-                    psi.Arguments = $"/stab \"{reportPath}\" /DisplayDisconnected 1";
-                    psi.WindowStyle = ProcessWindowStyle.Hidden;
-                    psi.Verb = "runas";
-                    Process.Start(psi).WaitForExit(5000);
-                }
+                string usbExe = "";
+                string[] files = Directory.GetFiles(binPath, "USBDeview.exe", SearchOption.AllDirectories);
+                if (files.Length > 0) usbExe = files[0];
+                else return;
+
+                string reportPath = Path.Combine(Path.GetDirectoryName(usbExe), "report.txt");
+
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = usbExe;
+                psi.Arguments = $"/stab \"{reportPath}\" /DisplayDisconnected 1";
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                psi.Verb = "runas";
+                Process.Start(psi).WaitForExit(5000);
 
                 if (File.Exists(reportPath))
                 {
@@ -299,7 +371,7 @@ namespace Launch_Manager
 
                                 Log(logLabel, "  > Removing artifact: " + match.Value); // SHOW THE USER
                                 ProcessStartInfo killPsi = new ProcessStartInfo();
-                                killPsi.FileName = usbDeviewPath;
+                                killPsi.FileName = usbExe;
                                 killPsi.Arguments = $"/remove_device_by_instance_id \"{match.Value}\"";
                                 killPsi.WindowStyle = ProcessWindowStyle.Hidden;
                                 killPsi.Verb = "runas";

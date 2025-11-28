@@ -1,5 +1,11 @@
+# Ignore the heavy resources
+*.zip
+*.qcow2
+resource.dat
+engine.zip
+
+# Ignore build output
 bin/
-data/
-.vs/
 obj/
+.vs/
 *.user
